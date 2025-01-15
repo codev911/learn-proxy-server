@@ -1,0 +1,9 @@
+[package]
+name = "exampleproxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.17", features = ["full"] }
+hyper = { version = "0.14.19", features = ["full"] }
+tokio-stream = { version = "0.1.9", features = ["full"] }
