@@ -14,7 +14,7 @@ use std::sync::Arc;
 // Constants for configuration
 const MAX_CONCURRENT_CONNECTIONS: usize = 1000;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024; // 10MB
+const MAX_REQUEST_SIZE: usize = 100 * 1024 * 1024; // 100MB
 
 // Function to tunnel HTTPS connections with timeout
 async fn tunnel(mut client_stream: TcpStream, host: String, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
