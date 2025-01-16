@@ -1,11 +1,50 @@
 use std::net::SocketAddr;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
-use hyper::{Request, Response, client::conn::http1::Builder, Uri};
+use hyper::{Request, Response, client::conn::http1::Builder, Uri, Method};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{self, AsyncWriteExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use bytes::Bytes;
+
+// Function to tunnel HTTPS connections
+async fn tunnel(client_stream: TcpStream, host: String, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Connect to remote server
+    let server_stream = match TcpStream::connect((host, port)).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            let mut client_stream = client_stream;
+            let error_msg = format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{}", e);
+            client_stream.write_all(error_msg.as_bytes()).await?;
+            return Err(Box::new(e));
+        }
+    };
+
+    let mut client_stream = client_stream;
+    // Send success response to client
+    client_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+
+    // Split both streams
+    let (mut client_read, mut client_write) = io::split(client_stream);
+    let (mut server_read, mut server_write) = io::split(server_stream);
+
+    // Copy bidirectionally
+    let client_to_server = async {
+        io::copy(&mut client_read, &mut server_write).await?;
+        server_write.shutdown().await
+    };
+
+    let server_to_client = async {
+        io::copy(&mut server_read, &mut client_write).await?;
+        client_write.shutdown().await
+    };
+
+    // Run both directions concurrently
+    tokio::try_join!(client_to_server, server_to_client)?;
+
+    Ok(())
+}
 
 async fn forward_request(
     mut req: Request<Incoming>,
@@ -70,10 +109,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Spawn new task for each connection
         tokio::task::spawn(async move {
             let io = TokioIo::new(stream);
-
+            
             // Create service function
-            let service = hyper::service::service_fn(|req: Request<Incoming>| async {
-                // Extract host and port from request
+            let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                // Handle CONNECT method differently (HTTPS)
+                if req.method() == Method::CONNECT {
+                    // Extract host and port from authority
+                    if let Some(addr) = req.uri().authority() {
+                        let host = addr.host().to_string();
+                        let port = addr.port_u16().unwrap_or(443);
+                        
+                        // Create new connection for tunneling
+                        match TcpStream::connect((host.clone(), port)).await {
+                            Ok(tunnel_stream) => {
+                                // Spawn HTTPS tunneling
+                                tokio::spawn(async move {
+                                    if let Err(e) = tunnel(tunnel_stream, host, port).await {
+                                        eprintln!("Tunnel error: {}", e);
+                                    }
+                                });
+                                
+                                // Return an empty response
+                                let empty_body = Full::new(Bytes::from(""))
+                                    .map_err(|never| match never {})
+                                    .boxed();
+                                return Ok(Response::new(empty_body));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to establish tunnel: {}", e);
+                                let error_body = Full::new(Bytes::from("Failed to establish tunnel"))
+                                    .map_err(|never| match never {})
+                                    .boxed();
+                                return Ok(Response::builder()
+                                    .status(502)
+                                    .body(error_body)
+                                    .unwrap());
+                            }
+                        }
+                    }
+                }
+
+                // Handle HTTP requests
                 let host = req.headers()
                     .get("host")
                     .and_then(|h| h.to_str().ok())
@@ -92,7 +168,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(target_stream) => forward_request(req, target_stream).await,
                     Err(e) => {
                         eprintln!("Failed to connect to target server: {}", e);
-                        // Create an error response with matching error type
                         let error_body = Full::new(Bytes::from("Failed to connect to target server"))
                             .map_err(|never| match never {})
                             .boxed();
