@@ -25,7 +25,6 @@ fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error + Send + 
     let cert_file = &mut BufReader::new(File::open("cert.pem")?);
     let key_file = &mut BufReader::new(File::open("key.pem")?);
 
-    // Collect certificates into a Vec
     let certs: Vec<_> = rustls_pemfile::certs(cert_file)
         .filter_map(|result| result.ok())
         .collect();
@@ -34,13 +33,11 @@ fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error + Send + 
         return Err("No certificate found in cert.pem".into());
     }
 
-    // Load private key
     let key = match rustls_pemfile::private_key(key_file)? {
         Some(key) => key,
         None => return Err("No private key found in key.pem".into()),
     };
 
-    // Build TLS configuration
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -49,12 +46,10 @@ fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error + Send + 
     Ok(config)
 }
 
-// Function to tunnel HTTPS connections with timeout
+// Function to handle HTTP(S) tunneling
 async fn tunnel(mut client_stream: TcpStream, host: String, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Set timeouts
     client_stream.set_nodelay(true)?;
     
-    // Connect to remote server with timeout
     let server_stream = match tokio::time::timeout(
         CONNECTION_TIMEOUT,
         TcpStream::connect((host, port))
@@ -73,53 +68,32 @@ async fn tunnel(mut client_stream: TcpStream, host: String, port: u16) -> Result
     };
 
     server_stream.set_nodelay(true)?;
-
-    // Send success response to client
     client_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-    // Split both streams
     let (mut client_read, mut client_write) = io::split(client_stream);
     let (mut server_read, mut server_write) = io::split(server_stream);
 
-    // Copy bidirectionally with timeout
-    let client_to_server = async {
-        let result = tokio::time::timeout(
-            CONNECTION_TIMEOUT,
-            io::copy(&mut client_read, &mut server_write)
-        ).await;
-        match result {
-            Ok(Ok(_)) => server_write.shutdown().await,
-            Ok(Err(e)) => Err(e),
-            Err(_) => Ok(()),
-        }
-    };
-
-    let server_to_client = async {
-        let result = tokio::time::timeout(
-            CONNECTION_TIMEOUT,
-            io::copy(&mut server_read, &mut client_write)
-        ).await;
-        match result {
-            Ok(Ok(_)) => client_write.shutdown().await,
-            Ok(Err(e)) => Err(e),
-            Err(_) => Ok(()),
-        }
-    };
-
-    // Run both directions concurrently
     tokio::select! {
-        res1 = client_to_server => res1?,
-        res2 = server_to_client => res2?,
+        res1 = io::copy(&mut client_read, &mut server_write) => {
+            if let Ok(_) = res1 {
+                server_write.shutdown().await?;
+            }
+        }
+        res2 = io::copy(&mut server_read, &mut client_write) => {
+            if let Ok(_) = res2 {
+                client_write.shutdown().await?;
+            }
+        }
     }
 
     Ok(())
 }
 
+// Function to forward HTTP requests
 async fn forward_request(
     mut req: Request<Incoming>,
     client_stream: TcpStream,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    // Set timeout for client stream
     if let Err(e) = client_stream.set_nodelay(true) {
         let error_body = Full::new(Bytes::from(format!("Failed to set TCP_NODELAY: {}", e)))
             .map_err(|never| match never {})
@@ -130,7 +104,6 @@ async fn forward_request(
             .unwrap());
     }
 
-    // Extract the target URI from the request
     let uri = if let Some(host) = req.headers().get("host") {
         let host_str = host.to_str().unwrap_or("").to_string();
         let path = req.uri().path_and_query()
@@ -145,23 +118,19 @@ async fn forward_request(
         req.uri().clone()
     };
 
-    // Update request URI to only include path
     *req.uri_mut() = uri;
 
-    // Set up client connection with timeout
     let io = TokioIo::new(client_stream);
     let (mut sender, conn) = Builder::new()
         .handshake(io)
         .await?;
 
-    // Spawn connection handling task
     tokio::task::spawn(async move {
         if let Err(err) = conn.await {
             eprintln!("Connection error: {}", err);
         }
     });
 
-    // Forward the request with timeout
     let response = match tokio::time::timeout(
         CONNECTION_TIMEOUT,
         sender.send_request(req)
@@ -187,16 +156,168 @@ async fn forward_request(
         }
     };
     
-    // Convert response body to BoxBody
     let (parts, body) = response.into_parts();
     let boxed_body = body.map_err(|e| e.into()).boxed();
     
     Ok(Response::from_parts(parts, boxed_body))
 }
 
+// Function to handle HTTP connections
+async fn handle_http(stream: TcpStream, addr: SocketAddr) {
+    println!("New HTTP connection from: {}", addr);
+    
+    let io = TokioIo::new(stream);
+    
+    let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+        if req.method() == Method::CONNECT {
+            if let Some(addr) = req.uri().authority() {
+                let host = addr.host().to_string();
+                let port = addr.port_u16().unwrap_or(443);
+                
+                match TcpStream::connect((host.clone(), port)).await {
+                    Ok(tunnel_stream) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = tunnel(tunnel_stream, host, port).await {
+                                eprintln!("Tunnel error: {}", e);
+                            }
+                        });
+                        
+                        let empty_body = Full::new(Bytes::from(""))
+                            .map_err(|never| match never {})
+                            .boxed();
+                        return Ok(Response::new(empty_body));
+                    }
+                    Err(e) => {
+                        let error_body = Full::new(Bytes::from(format!("Tunnel failed: {}", e)))
+                            .map_err(|never| match never {})
+                            .boxed();
+                        return Ok(Response::builder()
+                            .status(502)
+                            .body(error_body)
+                            .unwrap());
+                    }
+                }
+            }
+        }
+
+        let host = req.headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost");
+        
+        let port = if host.contains(":") {
+            host.split(":").nth(1).unwrap_or("80").parse().unwrap_or(80)
+        } else {
+            80
+        };
+        
+        let host = host.split(":").next().unwrap_or("localhost");
+
+        match TcpStream::connect((host, port)).await {
+            Ok(target_stream) => forward_request(req, target_stream).await,
+            Err(e) => {
+                let error_body = Full::new(Bytes::from(format!("Connection failed: {}", e)))
+                    .map_err(|never| match never {})
+                    .boxed();
+                Ok(Response::builder()
+                    .status(502)
+                    .body(error_body)
+                    .unwrap())
+            }
+        }
+    });
+
+    if let Err(err) = http1::Builder::new()
+        .max_buf_size(MAX_REQUEST_SIZE)
+        .serve_connection(io, service)
+        .await {
+        eprintln!("HTTP Server error: {}", err);
+    }
+}
+
+// Function to handle HTTPS connections
+async fn handle_https(stream: TcpStream, addr: SocketAddr, tls_acceptor: TlsAcceptor) {
+    println!("New HTTPS connection from: {}", addr);
+    
+    let tls_stream = match tls_acceptor.accept(stream).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("TLS error: {}", e);
+            return;
+        }
+    };
+    
+    let io = TokioIo::new(tls_stream);
+    
+    let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+        if req.method() == Method::CONNECT {
+            if let Some(addr) = req.uri().authority() {
+                let host = addr.host().to_string();
+                let port = addr.port_u16().unwrap_or(443);
+                
+                match TcpStream::connect((host.clone(), port)).await {
+                    Ok(tunnel_stream) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = tunnel(tunnel_stream, host, port).await {
+                                eprintln!("Tunnel error: {}", e);
+                            }
+                        });
+                        
+                        let empty_body = Full::new(Bytes::from(""))
+                            .map_err(|never| match never {})
+                            .boxed();
+                        return Ok(Response::new(empty_body));
+                    }
+                    Err(e) => {
+                        let error_body = Full::new(Bytes::from(format!("Tunnel failed: {}", e)))
+                            .map_err(|never| match never {})
+                            .boxed();
+                        return Ok(Response::builder()
+                            .status(502)
+                            .body(error_body)
+                            .unwrap());
+                    }
+                }
+            }
+        }
+
+        let host = req.headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost");
+        
+        let port = if host.contains(":") {
+            host.split(":").nth(1).unwrap_or("80").parse().unwrap_or(80)
+        } else {
+            80
+        };
+        
+        let host = host.split(":").next().unwrap_or("localhost");
+
+        match TcpStream::connect((host, port)).await {
+            Ok(target_stream) => forward_request(req, target_stream).await,
+            Err(e) => {
+                let error_body = Full::new(Bytes::from(format!("Connection failed: {}", e)))
+                    .map_err(|never| match never {})
+                    .boxed();
+                Ok(Response::builder()
+                    .status(502)
+                    .body(error_body)
+                    .unwrap())
+            }
+        }
+    });
+
+    if let Err(err) = http1::Builder::new()
+        .max_buf_size(MAX_REQUEST_SIZE)
+        .serve_connection(io, service)
+        .await {
+        eprintln!("HTTPS Server error: {}", err);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Increase file descriptor limit
     #[cfg(unix)]
     {
         let nofile = rlimit::Resource::NOFILE;
@@ -204,125 +325,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rlimit::setrlimit(nofile, hard, hard)?;
     }
 
-    // Load TLS configuration
     let tls_config = load_tls_config()?;
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-    // Create connection semaphore
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
-    // Bind to address
-    let addr: SocketAddr = ([0, 0, 0, 0], 8443).into();
-    let listener = TcpListener::bind(addr).await?;
-    println!("HTTPS Proxy server listening on https://{}", addr);
+    // Create HTTP listener
+    let http_addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
+    let http_listener = TcpListener::bind(http_addr).await?;
+    println!("HTTP Proxy server listening on http://{}", http_addr);
 
-    // Accept connections
+    // Create HTTPS listener
+    let https_addr: SocketAddr = ([0, 0, 0, 0], 8443).into();
+    let https_listener = TcpListener::bind(https_addr).await?;
+    println!("HTTPS Proxy server listening on https://{}", https_addr);
+
     loop {
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                eprintln!("Semaphore error - too many connections");
-                continue;
-            }
-        };
-
-        let (stream, addr) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("Failed to accept connection: {}", e);
-                continue;
-            }
-        };
-
-        println!("New connection from: {}", addr);
-        
+        let semaphore = semaphore.clone();
         let tls_acceptor = tls_acceptor.clone();
-        
-        // Spawn new task for each connection
-        tokio::task::spawn(async move {
-            let _permit = permit;
-            
-            // Accept TLS connection
-            let tls_stream = match tls_acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    eprintln!("TLS error: {}", e);
-                    return;
-                }
-            };
-            
-            let io = TokioIo::new(tls_stream);
-            
-            // Create service function
-            let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
-                // Handle CONNECT method differently (HTTPS)
-                if req.method() == Method::CONNECT {
-                    if let Some(addr) = req.uri().authority() {
-                        let host = addr.host().to_string();
-                        let port = addr.port_u16().unwrap_or(443);
-                        
-                        match TcpStream::connect((host.clone(), port)).await {
-                            Ok(tunnel_stream) => {
-                                tokio::spawn(async move {
-                                    if let Err(e) = tunnel(tunnel_stream, host, port).await {
-                                        eprintln!("Tunnel error: {}", e);
-                                    }
-                                });
-                                
-                                let empty_body = Full::new(Bytes::from(""))
-                                    .map_err(|never| match never {})
-                                    .boxed();
-                                return Ok(Response::new(empty_body));
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to establish tunnel: {}", e);
-                                let error_body = Full::new(Bytes::from(format!("Failed to establish tunnel: {}", e)))
-                                    .map_err(|never| match never {})
-                                    .boxed();
-                                return Ok(Response::builder()
-                                    .status(502)
-                                    .body(error_body)
-                                    .unwrap());
-                            }
-                        }
-                    }
-                }
 
-                let host = req.headers()
-                    .get("host")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("localhost");
-                
-                let port = if host.contains(":") {
-                    host.split(":").nth(1).unwrap_or("80").parse().unwrap_or(80)
-                } else {
-                    80
+        tokio::select! {
+            Ok((http_stream, addr)) = http_listener.accept() => {
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => continue,
                 };
-                
-                let host = host.split(":").next().unwrap_or("localhost");
 
-                match TcpStream::connect((host, port)).await {
-                    Ok(target_stream) => forward_request(req, target_stream).await,
-                    Err(e) => {
-                        eprintln!("Failed to connect to target server: {}", e);
-                        let error_body = Full::new(Bytes::from(format!("Failed to connect to target server: {}", e)))
-                            .map_err(|never| match never {})
-                            .boxed();
-                        Ok(Response::builder()
-                            .status(502)
-                            .body(error_body)
-                            .unwrap())
-                    }
-                }
-            });
-
-            // Process HTTPS connection with timeout
-            if let Err(err) = http1::Builder::new()
-                .max_buf_size(MAX_REQUEST_SIZE)
-                .serve_connection(io, service)
-                .await {
-                eprintln!("Server error: {}", err);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_http(http_stream, addr).await;
+                });
             }
-        });
+            Ok((https_stream, addr)) = https_listener.accept() => {
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => continue,
+                };
+
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_https(https_stream, addr, tls_acceptor).await;
+                });
+            }
+        }
     }
 }
