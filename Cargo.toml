@@ -10,3 +10,6 @@ hyper-util = { version = "0.1.10", features = ["full"] }
 http-body-util = "0.1.2"
 bytes = "1.9.0"
 rlimit = "0.10.2"
+rustls = "0.23.21"
+rustls-pemfile = "2.2.0"
+tokio-rustls = "0.26.1"

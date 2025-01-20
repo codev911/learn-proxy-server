@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
+use std::sync::Arc;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::{Request, Response, client::conn::http1::Builder, Uri, Method};
@@ -9,12 +10,44 @@ use tokio::io::{self, AsyncWriteExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use bytes::Bytes;
 use tokio::sync::Semaphore;
-use std::sync::Arc;
+use rustls::ServerConfig;
+use std::fs::File;
+use std::io::BufReader;
+use tokio_rustls::TlsAcceptor;
 
 // Constants for configuration
 const MAX_CONCURRENT_CONNECTIONS: usize = 1000;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 100 * 1024 * 1024; // 100MB
+
+// Function to load TLS configuration
+fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let cert_file = &mut BufReader::new(File::open("cert.pem")?);
+    let key_file = &mut BufReader::new(File::open("key.pem")?);
+
+    // Collect certificates into a Vec
+    let certs: Vec<_> = rustls_pemfile::certs(cert_file)
+        .filter_map(|result| result.ok())
+        .collect();
+
+    if certs.is_empty() {
+        return Err("No certificate found in cert.pem".into());
+    }
+
+    // Load private key
+    let key = match rustls_pemfile::private_key(key_file)? {
+        Some(key) => key,
+        None => return Err("No private key found in key.pem".into()),
+    };
+
+    // Build TLS configuration
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| format!("TLS config error: {}", err))?;
+
+    Ok(config)
+}
 
 // Function to tunnel HTTPS connections with timeout
 async fn tunnel(mut client_stream: TcpStream, host: String, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -171,17 +204,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rlimit::setrlimit(nofile, hard, hard)?;
     }
 
+    // Load TLS configuration
+    let tls_config = load_tls_config()?;
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
     // Create connection semaphore
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     // Bind to address
-    let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
+    let addr: SocketAddr = ([0, 0, 0, 0], 8443).into();
     let listener = TcpListener::bind(addr).await?;
-    println!("Proxy server listening on http://{}", addr);
+    println!("HTTPS Proxy server listening on https://{}", addr);
 
     // Accept connections
     loop {
-        // Acquire semaphore permit
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -200,31 +236,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         println!("New connection from: {}", addr);
         
+        let tls_acceptor = tls_acceptor.clone();
+        
         // Spawn new task for each connection
         tokio::task::spawn(async move {
-            let _permit = permit; // Keep permit alive for the duration of the connection
-            let io = TokioIo::new(stream);
+            let _permit = permit;
+            
+            // Accept TLS connection
+            let tls_stream = match tls_acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    eprintln!("TLS error: {}", e);
+                    return;
+                }
+            };
+            
+            let io = TokioIo::new(tls_stream);
             
             // Create service function
             let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
                 // Handle CONNECT method differently (HTTPS)
                 if req.method() == Method::CONNECT {
-                    // Extract host and port from authority
                     if let Some(addr) = req.uri().authority() {
                         let host = addr.host().to_string();
                         let port = addr.port_u16().unwrap_or(443);
                         
-                        // Create new connection for tunneling
                         match TcpStream::connect((host.clone(), port)).await {
                             Ok(tunnel_stream) => {
-                                // Spawn HTTPS tunneling
                                 tokio::spawn(async move {
                                     if let Err(e) = tunnel(tunnel_stream, host, port).await {
                                         eprintln!("Tunnel error: {}", e);
                                     }
                                 });
                                 
-                                // Return an empty response
                                 let empty_body = Full::new(Bytes::from(""))
                                     .map_err(|never| match never {})
                                     .boxed();
@@ -244,7 +288,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
 
-                // Handle HTTP requests
                 let host = req.headers()
                     .get("host")
                     .and_then(|h| h.to_str().ok())
@@ -258,7 +301,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 
                 let host = host.split(":").next().unwrap_or("localhost");
 
-                // Connect to target server
                 match TcpStream::connect((host, port)).await {
                     Ok(target_stream) => forward_request(req, target_stream).await,
                     Err(e) => {
@@ -274,7 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
 
-            // Process HTTP connection with timeout
+            // Process HTTPS connection with timeout
             if let Err(err) = http1::Builder::new()
                 .max_buf_size(MAX_REQUEST_SIZE)
                 .serve_connection(io, service)
